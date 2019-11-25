@@ -1,9 +1,0 @@
-[general]
-threads = 16
-
-[hec]
-  [hec.headers]
-  Authorization = "Splunk d1599a74-03f4-43eb-a10f-a1a02623824c"
-
-[gdelt]
-index = "gdelt"
