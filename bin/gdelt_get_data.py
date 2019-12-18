@@ -19,11 +19,15 @@ def get_master_list(url):
 
     r = s.get(url)
 
-    append_to_data_list(r)
+    @try_response
+    def get_text(r):
+        return r.text
+
+    append_to_data_list(get_text(r))
 
 @try_response
-def append_to_data_list(r, *args, **kwargs):
-    rows = r.text.splitlines()
+def append_to_data_list(text):
+    rows = text.splitlines()
 
     logger.debug("Got rows.", extra={"row_count": len(rows)})
 
@@ -42,71 +46,67 @@ def append_to_data_list(r, *args, **kwargs):
 
     logger.debug("Skipped rows.", extra={"skipped_count": skipped})
 
-def get_url(url):
-    r = s.get(url)
+@try_response
+def send_events(r):
+    url = r.url
+    meta = {
+        "request_id": r.request_id,
+        "url": url,
+    }
 
-    @try_response
-    def send_events(r, *args, **kwargs):
-        meta = {
-            "url": url,
-            "request_id": r.request_id,
-        }
+    logger.debug("Unzipping url...", extra=meta)
 
-        logger.debug("Unzipping url...", extra=meta)
+    with ZipFile(BytesIO(r.content)) as zf:
+        for name in zf.namelist():
+            with zf.open(name, "r") as csv_file:
+                # https://stackoverflow.com/a/52259169/1150923
+                csv_file.seek(0, os.SEEK_END)
+                if csv_file.tell():
+                    csv_file.seek(0)
+                else:
+                    logger.warning("Ignoring empty file.", extra=meta)
+                    return
 
-        with ZipFile(BytesIO(r.content)) as zf:
-            for name in zf.namelist():
-                with zf.open(name, "r") as csv_file:
-                    # https://stackoverflow.com/a/52259169/1150923
-                    csv_file.seek(0, os.SEEK_END)
-                    if csv_file.tell():
-                        csv_file.seek(0)
-                    else:
-                        logger.warning("Ignoring empty file.", extra=meta)
-                        return
+                search = re.search(r"gdeltv2\/(\d+)(?:\.translation)?\.(\w+)\.CSV", url)
+                gdelt_id = int(search.group(1))
+                gdelt_type = "event" if search.group(2) == "export" else "mention"
 
-                    search = re.search(r"gdeltv2\/(\d+)(?:\.translation)?\.(\w+)\.CSV", url)
-                    gdelt_id = int(search.group(1))
-                    gdelt_type = "event" if search.group(2) == "export" else "mention"
+                csv_header = event_header if gdelt_type == "event" else mention_header
+                reader = csv.DictReader(TextIOWrapper(csv_file), delimiter="\t", fieldnames=csv_header)
 
-                    csv_header = event_header if gdelt_type == "event" else mention_header
-                    reader = csv.DictReader(TextIOWrapper(csv_file), delimiter="\t", fieldnames=csv_header)
+                data = ""
 
-                    data = ""
+                i = 1
+                for i, row in enumerate(reader, 1):
+                    row["splunk_rest"] = {
+                        "session_id": sr.session_id,
+                        "request_id": r.request_id,
+                    }
+                    row["url"] = url
+                    row["row"] = i
 
-                    i = 1
-                    for i, row in enumerate(reader, 1):
-                        row["splunk_rest"] = {
-                            "session_id": sr.session_id,
-                            "request_id": r.request_id,
-                        }
-                        row["url"] = url
-                        row["row"] = i
+                    if gdelt_type == "event":
+                        row["QuadClassFull"] = event_quad_class[int(row["QuadClass"])-1]
+                    elif gdelt_type == "mention":
+                        row["MentionTypeFull"] = mention_types[int(row["MentionType"])-1]
 
-                        if gdelt_type == "event":
-                            row["QuadClassFull"] = event_quad_class[int(row["QuadClass"])-1]
-                        elif gdelt_type == "mention":
-                            row["MentionTypeFull"] = mention_types[int(row["MentionType"])-1]
+                    event = {
+                        # id=20191121011500 becomes
+                        # 2019-11-21-01:15:00
+                        "time": datetime.strptime(str(gdelt_id), "%Y%m%d%H%M%S").timestamp(),
+                        "index": index,
+                        "sourcetype": "gdelt_" + gdelt_type,
+                        "source": __file__,
+                        "event": row,
+                    }
 
-                        event = {
-                            # id=20191121011500 becomes
-                            # 2019-11-21-01:15:00
-                            "time": datetime.strptime(str(gdelt_id), "%Y%m%d%H%M%S").timestamp(),
-                            "index": index,
-                            "sourcetype": "gdelt_" + gdelt_type,
-                            "source": __file__,
-                            "event": row,
-                        }
+                    data += json.dumps(event)
 
-                        data += json.dumps(event)
+                m = meta.copy()
+                m["row_count"] = i
+                logger.debug("Found rows in url", extra=m)
 
-                    m = meta.copy()
-                    m["row_count"] = i
-                    logger.debug("Found rows in url", extra=m)
-
-                    s.post(hec_url, headers=hec_headers, data=data)
-
-    send_events(r)
+                s.post(hec_url, headers=hec_headers, data=data)
 
 @splunk_rest
 def gdelt_data():
@@ -129,6 +129,10 @@ def gdelt_data():
         sr.multiprocess(get_master_list, master_urls)
 
     logger.info("Created data list.", extra={"data_list_count": len(urls)})
+
+    def get_url(url):
+        r = s.get(url)
+        send_events(r)
 
     sr.multiprocess(get_url, urls)
 
